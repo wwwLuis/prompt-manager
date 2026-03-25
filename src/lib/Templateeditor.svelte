@@ -1,0 +1,1049 @@
+<script lang="ts">
+  import { fly, fade, slide } from "svelte/transition";
+  import {
+    templates,
+    categories,
+    snippets,
+    genId,
+    extractPlaceholders,
+    extractSnippetRefs,
+    type Template,
+  } from "./store";
+
+  export let template: Template | null;
+  export let onSave: () => void;
+  export let onCancel: () => void;
+
+  let name = template?.name || "";
+  let body = template?.body || "";
+  let categoryList: string[] = template?.category ? [...template.category] : [];
+  let newCatInput = "";
+  let optionals: string[] = template?.optionals ? [...template.optionals] : [];
+  let eitherOrs: string[][] = template?.eitherOrs
+    ? template.eitherOrs.map((g) => [...g])
+    : [];
+  let textareas: Set<string> = new Set(template?.textareas ?? []);
+  let newOpt = "";
+  let newEoOptions: string[] = ["", ""];  // current either/or group being built
+  let showCatSuggestions = false;
+
+  // ── Snippet autocomplete ──
+  let bodyEl: HTMLTextAreaElement;
+  let acVisible = false;
+  let acQuery = "";
+  let acIndex = 0;
+  let acStart = -1; // cursor position where [[ starts
+  let acTop = 0;
+  let acLeft = 0;
+
+  $: acFiltered = acQuery
+    ? $snippets.filter((s) =>
+        s.key.toLowerCase().startsWith(acQuery.toLowerCase())
+      )
+    : $snippets;
+
+  function handleBodyInput() {
+    if (!bodyEl) return;
+    const pos = bodyEl.selectionStart;
+    const text = bodyEl.value;
+
+    // Look backwards from cursor for [[ that isn't closed yet
+    const before = text.slice(0, pos);
+    const openIdx = before.lastIndexOf("[[");
+    const closeIdx = before.lastIndexOf("]]");
+
+    if (openIdx >= 0 && openIdx > closeIdx) {
+      const partial = before.slice(openIdx + 2);
+      // Only show if partial is a valid key fragment (word chars only, no newlines)
+      if (/^\w*$/.test(partial) && $snippets.length > 0) {
+        acQuery = partial;
+        acStart = openIdx;
+        acIndex = 0;
+        acVisible = true;
+        positionDropdown();
+        return;
+      }
+    }
+
+    acVisible = false;
+  }
+
+  function positionDropdown() {
+    if (!bodyEl) return;
+    // Use a mirror div to measure caret position
+    const rect = bodyEl.getBoundingClientRect();
+    const style = getComputedStyle(bodyEl);
+    const lineHeight = parseFloat(style.lineHeight) || 20;
+    const paddingTop = parseFloat(style.paddingTop) || 0;
+    const paddingLeft = parseFloat(style.paddingLeft) || 0;
+
+    // Approximate: count newlines before cursor for vertical offset
+    const textBefore = bodyEl.value.slice(0, bodyEl.selectionStart);
+    const lines = textBefore.split("\n");
+    const lineNum = lines.length - 1;
+    const lastLine = lines[lines.length - 1];
+
+    // Approximate char width using monospace assumption
+    const charWidth = 7.8; // ~13px monospace font
+
+    acTop = paddingTop + (lineNum + 1) * lineHeight - bodyEl.scrollTop;
+    acLeft = paddingLeft + lastLine.length * charWidth;
+
+    // Clamp to not go off-screen
+    const maxLeft = bodyEl.offsetWidth - 220;
+    if (acLeft > maxLeft) acLeft = maxLeft;
+    if (acLeft < 0) acLeft = 0;
+  }
+
+  function insertSnippet(key: string) {
+    if (!bodyEl || acStart < 0) return;
+    const before = body.slice(0, acStart);
+    const after = body.slice(bodyEl.selectionStart);
+    body = before + `[[${key}]]` + after;
+    acVisible = false;
+
+    // Restore focus and cursor position
+    requestAnimationFrame(() => {
+      if (!bodyEl) return;
+      const newPos = acStart + key.length + 4; // [[ + key + ]]
+      bodyEl.focus();
+      bodyEl.setSelectionRange(newPos, newPos);
+    });
+  }
+
+  function handleBodyKeydown(e: KeyboardEvent) {
+    if (!acVisible || acFiltered.length === 0) return;
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      acIndex = (acIndex + 1) % acFiltered.length;
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      acIndex = (acIndex - 1 + acFiltered.length) % acFiltered.length;
+    } else if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      insertSnippet(acFiltered[acIndex].key);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      acVisible = false;
+    }
+  }
+
+  function handleBodyBlur() {
+    // Small delay so click on dropdown item can fire first
+    setTimeout(() => (acVisible = false), 150);
+  }
+
+  $: placeholders = extractPlaceholders(body);
+  $: snippetRefs = extractSnippetRefs(body);
+  $: availableSnippetKeys = $snippets.map((s) => s.key);
+  $: canSave = name.trim().length > 0 && body.trim().length > 0;
+
+  function toggleTextarea(p: string) {
+    if (textareas.has(p)) {
+      textareas.delete(p);
+    } else {
+      textareas.add(p);
+    }
+    textareas = new Set(textareas); // trigger reactivity
+  }
+
+  function addOptional() {
+    const trimmed = newOpt.trim();
+    if (trimmed && !optionals.includes(trimmed)) {
+      optionals = [...optionals, trimmed];
+      newOpt = "";
+    }
+  }
+
+  function removeOptional(i: number) {
+    optionals = optionals.filter((_, idx) => idx !== i);
+  }
+
+  function moveOptional(i: number, dir: -1 | 1) {
+    const j = i + dir;
+    if (j < 0 || j >= optionals.length) return;
+    const copy = [...optionals];
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+    optionals = copy;
+  }
+
+  function updateOptional(i: number, newVal: string) {
+    const trimmed = newVal.trim();
+    if (!trimmed) return;
+    if (optionals.some((o, idx) => idx !== i && o === trimmed)) return;
+    optionals = optionals.map((o, idx) => (idx === i ? trimmed : o));
+  }
+
+  function addEoOption() {
+    newEoOptions = [...newEoOptions, ""];
+  }
+
+  function removeEoOption(i: number) {
+    if (newEoOptions.length <= 2) return;
+    newEoOptions = newEoOptions.filter((_, idx) => idx !== i);
+  }
+
+  function addEitherOrGroup() {
+    const trimmed = newEoOptions.map((o) => o.trim()).filter(Boolean);
+    if (trimmed.length < 2) return;
+    eitherOrs = [...eitherOrs, trimmed];
+    newEoOptions = ["", ""];
+  }
+
+  function removeEitherOrGroup(i: number) {
+    eitherOrs = eitherOrs.filter((_, idx) => idx !== i);
+  }
+
+  function moveEitherOrGroup(i: number, dir: -1 | 1) {
+    const j = i + dir;
+    if (j < 0 || j >= eitherOrs.length) return;
+    const copy = [...eitherOrs];
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+    eitherOrs = copy;
+  }
+
+  function updateEitherOrOption(gi: number, oi: number, newVal: string) {
+    const trimmed = newVal.trim();
+    if (!trimmed) return;
+    eitherOrs = eitherOrs.map((group, gIdx) =>
+      gIdx === gi ? group.map((opt, oIdx) => (oIdx === oi ? trimmed : opt)) : group
+    );
+  }
+
+  function handleSave() {
+    if (!canSave) return;
+    templates.save({
+      id: template?.id || genId(),
+      name: name.trim(),
+      body: body.trim(),
+      placeholders,
+      textareas: [...textareas].filter((t) => placeholders.includes(t)),
+      optionals,
+      eitherOrs,
+      category: categoryList,
+      favorite: template?.favorite || false,
+    });
+    onSave();
+  }
+
+  function addCategory() {
+    const trimmed = newCatInput.trim();
+    if (trimmed && !categoryList.includes(trimmed)) {
+      categoryList = [...categoryList, trimmed];
+      newCatInput = "";
+    }
+  }
+
+  function removeCategory(i: number) {
+    categoryList = categoryList.filter((_, idx) => idx !== i);
+  }
+
+  function selectCategory(cat: string) {
+    if (!categoryList.includes(cat)) {
+      categoryList = [...categoryList, cat];
+    }
+    newCatInput = "";
+    showCatSuggestions = false;
+  }
+</script>
+
+<div class="editor">
+  <!-- Header -->
+  <div class="header">
+    <button class="back-btn" on:click={onCancel} title="Zurück">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <line x1="19" y1="12" x2="5" y2="12" />
+        <polyline points="12 19 5 12 12 5" />
+      </svg>
+    </button>
+    <h2>{template ? "Template bearbeiten" : "Neues Template"}</h2>
+  </div>
+
+  <!-- Name -->
+  <div class="field">
+    <label class="label" for="tpl-name">Name</label>
+    <input
+      id="tpl-name"
+      bind:value={name}
+      placeholder="z. B. Code Review"
+    />
+  </div>
+
+  <!-- Categories -->
+  <div class="field cat-field">
+    <label class="label">Kategorien</label>
+    {#if categoryList.length > 0}
+      <div class="cat-tags">
+        {#each categoryList as cat, i}
+          <span class="cat-tag" in:fly={{ x: -6, duration: 120 }} out:fade={{ duration: 80 }}>
+            {cat}
+            <button class="cat-tag-remove" on:click={() => removeCategory(i)} title="Entfernen">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </span>
+        {/each}
+      </div>
+    {/if}
+    <div class="cat-input-row">
+      <input
+        bind:value={newCatInput}
+        on:keydown={(e) => e.key === "Enter" && addCategory()}
+        on:focus={() => (showCatSuggestions = true)}
+        on:blur={() => setTimeout(() => (showCatSuggestions = false), 150)}
+        placeholder="Kategorie hinzufügen…"
+      />
+      <button class="btn-secondary add-btn" on:click={addCategory} title="Hinzufügen">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+        </svg>
+      </button>
+    </div>
+    {#if showCatSuggestions && $categories.filter((c) => !categoryList.includes(c) && c.toLowerCase().includes(newCatInput.toLowerCase())).length > 0}
+      <div class="cat-suggestions" transition:slide={{ duration: 120 }}>
+        {#each $categories.filter((c) => !categoryList.includes(c) && c.toLowerCase().includes(newCatInput.toLowerCase())) as cat}
+          <button class="cat-option" on:mousedown|preventDefault={() => selectCategory(cat)}>
+            {cat}
+          </button>
+        {/each}
+      </div>
+    {/if}
+  </div>
+
+  <!-- Body -->
+  <div class="field body-field">
+    <label class="label" for="tpl-body">
+      Template-Body
+      <span class="hint">{"{{name}}"} für Platzhalter &middot; {"[["} für Snippets</span>
+    </label>
+    <div class="body-textarea-wrap">
+      <textarea
+        id="tpl-body"
+        bind:this={bodyEl}
+        bind:value={body}
+        on:input={handleBodyInput}
+        on:keydown={handleBodyKeydown}
+        on:blur={handleBodyBlur}
+        placeholder={"Überprüfe diesen Code:\n\n```\n{{code}}\n```"}
+        rows="8"
+      ></textarea>
+
+      <!-- Snippet autocomplete dropdown -->
+      {#if acVisible && acFiltered.length > 0}
+        <div
+          class="ac-dropdown"
+          style="top: {acTop}px; left: {acLeft}px;"
+          transition:fly={{ y: -4, duration: 100 }}
+        >
+          {#each acFiltered as s, i}
+            <button
+              class="ac-item"
+              class:highlighted={i === acIndex}
+              on:mousedown|preventDefault={() => insertSnippet(s.key)}
+              on:mouseenter={() => (acIndex = i)}
+            >
+              <code class="ac-key">[[{s.key}]]</code>
+              {#if s.description}
+                <span class="ac-desc">{s.description}</span>
+              {/if}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
+    {#if placeholders.length > 0}
+      <div class="placeholder-config" in:fade={{ duration: 120 }}>
+        <span class="detected-label">Platzhalter-Typ festlegen:</span>
+        <div class="placeholder-list">
+          {#each placeholders as p}
+            <div class="placeholder-item" in:fly={{ y: 6, duration: 120 }}>
+              <span class="placeholder-name">{`{{${p}}}`}</span>
+              <div class="type-toggle">
+                <button
+                  class="type-btn"
+                  class:active={!textareas.has(p)}
+                  on:click={() => { if (textareas.has(p)) toggleTextarea(p); }}
+                  title="Einzeiliges Textfeld"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <line x1="4" y1="12" x2="20" y2="12" />
+                  </svg>
+                  Input
+                </button>
+                <button
+                  class="type-btn"
+                  class:active={textareas.has(p)}
+                  on:click={() => { if (!textareas.has(p)) toggleTextarea(p); }}
+                  title="Mehrzeiliges Textfeld"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <line x1="4" y1="8" x2="20" y2="8" />
+                    <line x1="4" y1="12" x2="20" y2="12" />
+                    <line x1="4" y1="16" x2="14" y2="16" />
+                  </svg>
+                  Textarea
+                </button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    <!-- Snippet references in body -->
+    {#if snippetRefs.length > 0}
+      <div class="snippet-refs" in:fade={{ duration: 120 }}>
+        <span class="detected-label">Snippets verwendet:</span>
+        <div class="snippet-ref-list">
+          {#each snippetRefs as ref}
+            <span class="snippet-ref-tag" class:missing={!availableSnippetKeys.includes(ref)}>
+              [[{ref}]]
+              {#if !availableSnippetKeys.includes(ref)}
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+              {/if}
+            </span>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+  </div>
+
+  <!-- Optionals -->
+  <div class="field">
+    <label class="label" for="opt-input">Optionale Anhänge</label>
+    <div class="opt-input-row">
+      <input
+        id="opt-input"
+        bind:value={newOpt}
+        on:keydown={(e) => e.key === "Enter" && addOptional()}
+        placeholder="z. B. Halte die Kommentare minimalistisch"
+      />
+      <button class="btn-secondary add-btn" on:click={addOptional} title="Hinzufügen">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+        </svg>
+      </button>
+    </div>
+
+    {#if optionals.length > 0}
+      <div class="opt-list">
+        {#each optionals as o, i (i)}
+          <div
+            class="opt-item"
+            in:fly={{ x: -10, duration: 150 }}
+            out:fade={{ duration: 100 }}
+          >
+            <input
+              class="opt-text-edit"
+              value={o}
+              on:blur={(e) => updateOptional(i, e.currentTarget.value)}
+              on:keydown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+            />
+            <div class="reorder-btns">
+              <button class="icon-btn reorder-btn" disabled={i === 0} on:click={() => moveOptional(i, -1)} title="Nach oben">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <polyline points="18 15 12 9 6 15" />
+                </svg>
+              </button>
+              <button class="icon-btn reorder-btn" disabled={i === optionals.length - 1} on:click={() => moveOptional(i, 1)} title="Nach unten">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+            </div>
+            <button class="icon-btn danger" on:click={() => removeOptional(i)} title="Entfernen">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+
+  <!-- Either/Or Groups -->
+  <div class="field">
+    <span class="label">Entweder / Oder</span>
+
+    <!-- Existing groups -->
+    {#if eitherOrs.length > 0}
+      <div class="eo-groups">
+        {#each eitherOrs as group, gi (gi)}
+          <div
+            class="eo-group"
+            in:fly={{ x: -10, duration: 150 }}
+            out:fade={{ duration: 100 }}
+          >
+            <div class="eo-group-options">
+              {#each group as opt, oi}
+                {#if oi > 0}
+                  <span class="eo-separator">ODER</span>
+                {/if}
+                <input
+                  class="eo-option-edit"
+                  value={opt}
+                  on:blur={(e) => updateEitherOrOption(gi, oi, e.currentTarget.value)}
+                  on:keydown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                />
+              {/each}
+            </div>
+            <div class="reorder-btns">
+              <button class="icon-btn reorder-btn" disabled={gi === 0} on:click={() => moveEitherOrGroup(gi, -1)} title="Nach oben">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <polyline points="18 15 12 9 6 15" />
+                </svg>
+              </button>
+              <button class="icon-btn reorder-btn" disabled={gi === eitherOrs.length - 1} on:click={() => moveEitherOrGroup(gi, 1)} title="Nach unten">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+            </div>
+            <button class="icon-btn danger" on:click={() => removeEitherOrGroup(gi)} title="Entfernen">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
+    <!-- New group builder -->
+    <div class="eo-builder">
+      {#each newEoOptions as opt, i}
+        <div class="eo-input-row">
+          {#if i > 0}
+            <span class="eo-separator">ODER</span>
+          {/if}
+          <div class="eo-input-wrap">
+            <input
+              bind:value={newEoOptions[i]}
+              on:keydown={(e) => e.key === "Enter" && addEitherOrGroup()}
+              placeholder="Option {i + 1}…"
+            />
+            {#if newEoOptions.length > 2}
+              <button class="icon-btn danger eo-remove-opt" on:click={() => removeEoOption(i)} title="Option entfernen">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            {/if}
+          </div>
+        </div>
+      {/each}
+      <div class="eo-actions">
+        <button class="btn-secondary eo-add-opt-btn" on:click={addEoOption} title="Weitere Option">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          Option
+        </button>
+        <button class="btn-secondary eo-add-group-btn" on:click={addEitherOrGroup} title="Gruppe hinzufügen">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+          Hinzufügen
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Save -->
+  <button class="btn-primary save-btn" disabled={!canSave} on:click={handleSave}>
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
+    Speichern
+  </button>
+</div>
+
+<style>
+  .editor {
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 4px;
+  }
+
+  h2 {
+    font-size: 19px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.02em;
+  }
+
+  .back-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    background: var(--bg-card);
+    border: 1.5px solid var(--border-light);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    transition: all var(--transition);
+    flex-shrink: 0;
+  }
+
+  .back-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+    border-color: var(--border);
+    transform: translateX(-2px);
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .hint {
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-left: 8px;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+
+  .body-textarea-wrap {
+    position: relative;
+  }
+
+  .body-field textarea {
+    min-height: 160px;
+    font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+
+  /* ── Autocomplete Dropdown ── */
+  .ac-dropdown {
+    position: absolute;
+    z-index: 50;
+    min-width: 200px;
+    max-width: 320px;
+    max-height: 180px;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 4px;
+  }
+
+  .ac-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-size: 12.5px;
+    color: var(--text);
+    transition: background 0.1s;
+  }
+
+  .ac-item:hover,
+  .ac-item.highlighted {
+    background: var(--accent-bg);
+  }
+
+  .ac-key {
+    font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .ac-desc {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .placeholder-config {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .detected-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  .placeholder-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .placeholder-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    transition: all var(--transition);
+  }
+
+  .placeholder-item:hover {
+    border-color: var(--border);
+  }
+
+  .placeholder-name {
+    font-size: 12.5px;
+    font-weight: 600;
+    font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    color: var(--text);
+  }
+
+  .type-toggle {
+    display: flex;
+    gap: 2px;
+    background: var(--bg);
+    border-radius: 8px;
+    padding: 2px;
+    border: 1px solid var(--border-light);
+  }
+
+  .type-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text-muted);
+    border-radius: 6px;
+    transition: all var(--transition);
+    white-space: nowrap;
+  }
+
+  .type-btn:hover {
+    color: var(--text-secondary);
+  }
+
+  .type-btn.active {
+    background: var(--accent);
+    color: #fff;
+    box-shadow: 0 1px 4px rgba(99, 102, 241, 0.25);
+  }
+
+  .cat-field {
+    position: relative;
+  }
+
+  .cat-tags {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  .cat-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    font-size: 12.5px;
+    font-weight: 500;
+    background: var(--accent-bg);
+    color: var(--accent);
+    border-radius: 14px;
+    border: 1px solid var(--accent-border);
+  }
+
+  .cat-tag-remove {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    color: var(--accent);
+    opacity: 0.6;
+    transition: opacity var(--transition);
+  }
+
+  .cat-tag-remove:hover {
+    opacity: 1;
+  }
+
+  .cat-input-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .cat-input-row input {
+    flex: 1;
+  }
+
+  .cat-suggestions {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    z-index: 10;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+
+  .cat-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 9px 14px;
+    font-size: 13px;
+    color: var(--text);
+    transition: background var(--transition);
+  }
+
+  .cat-option:hover {
+    background: var(--bg-hover);
+  }
+
+  .opt-input-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .opt-input-row input {
+    flex: 1;
+  }
+
+  .add-btn {
+    flex-shrink: 0;
+    width: 42px;
+    padding: 0;
+  }
+
+  .opt-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .opt-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    padding: 6px 12px;
+    transition: all var(--transition);
+  }
+
+  .opt-item:hover {
+    border-color: var(--border);
+  }
+
+  .opt-text-edit {
+    flex: 1;
+    font-size: 13px;
+    color: var(--text);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 2px 6px;
+    transition: all var(--transition);
+  }
+
+  .reorder-btns {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+
+  .reorder-btn {
+    width: 24px !important;
+    height: 18px !important;
+    padding: 0 !important;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .reorder-btn:disabled {
+    opacity: 0.25;
+    cursor: default;
+  }
+
+  .opt-text-edit:focus {
+    background: var(--bg);
+    border-color: var(--border);
+    outline: none;
+  }
+
+  .save-btn {
+    width: 100%;
+    padding: 13px;
+    margin-top: 4px;
+    font-size: 14px;
+  }
+
+  /* ── Snippet references ── */
+  .snippet-refs {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .snippet-ref-list {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .snippet-ref-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 9px;
+    font-size: 11.5px;
+    font-weight: 600;
+    font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    border-radius: 6px;
+    background: var(--accent-bg);
+    color: var(--accent);
+  }
+
+  .snippet-ref-tag.missing {
+    background: var(--danger-bg);
+    color: var(--danger);
+  }
+
+  /* ── Either/Or Groups ── */
+  .eo-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
+  .eo-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    transition: all var(--transition);
+  }
+
+  .eo-group:hover {
+    border-color: var(--border);
+  }
+
+  .eo-group-options {
+    flex: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text);
+  }
+
+  .eo-option-edit {
+    padding: 2px 8px;
+    background: var(--accent-bg);
+    border-radius: 5px;
+    color: var(--text);
+    border: 1px solid transparent;
+    font-size: 13px;
+    transition: all var(--transition);
+    min-width: 60px;
+  }
+
+  .eo-option-edit:focus {
+    background: var(--bg);
+    border-color: var(--border);
+    outline: none;
+  }
+
+  .eo-separator {
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    flex-shrink: 0;
+  }
+
+  .eo-builder {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .eo-input-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .eo-input-wrap {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .eo-input-wrap input {
+    flex: 1;
+  }
+
+  .eo-remove-opt {
+    flex-shrink: 0;
+  }
+
+  .eo-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+  }
+
+  .eo-add-opt-btn,
+  .eo-add-group-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    padding: 6px 12px;
+  }
+
+</style>
