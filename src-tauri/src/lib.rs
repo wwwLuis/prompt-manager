@@ -15,10 +15,14 @@ pub fn run() {
                 .with_handler(move |app, _sc, event| {
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
                         if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
+                            let visible = window.is_visible().unwrap_or(true);
+                            let opend = !(window.is_minimized().unwrap_or(true));
+
+                            if visible && opend{
                                 let _ = window.hide();
                             } else {
                                 let _ = window.show();
+                                let _ = window.unminimize();
                                 let _ = window.set_focus();
                             }
                         }
