@@ -33,11 +33,33 @@ Instead of rewriting the same prompt every time, you define a template once — 
 
 ### Templates with Dynamic Placeholders
 
-Write template bodies using `{{name}}` placeholder syntax. When using a template, input fields are automatically generated for each placeholder — either as single-line inputs or multi-line textareas.
+Write template bodies using `{{name}}` placeholder syntax. When using a template, input fields are automatically generated for each placeholder. Each placeholder can be configured as one of four types:
 
-### Optional Blocks
+| Type | Description |
+|------|-------------|
+| **Input** | Single-line text field (default) |
+| **Textarea** | Multi-line text area for longer content |
+| **Liste** | Formatted list — add entries one by one, output as `- item` lines |
+| **Auswahl** | Dropdown with predefined options (custom text and/or snippet references) |
 
-Define optional text blocks (e.g. *"Keep comments minimal"*) that can be toggled on or off via checkboxes when building a prompt. Reorder them with up/down buttons, edit their text inline at any time.
+### Optional Variables & Block Syntax
+
+Mark any placeholder as **optional** to get a toggle button ("an"/"aus") in the builder. When disabled, the line containing that placeholder is removed from the output.
+
+For more control, wrap surrounding text in block markers:
+```
+{{#varname}}This text with {{varname}} is only included when enabled.{{/varname}}
+```
+Disabling the variable removes the entire block — not just the placeholder line.
+
+**Standalone blocks** (without a matching `{{varname}}` inside) work as pure section toggles:
+```
+{{#disclaimer}}This entire disclaimer section can be toggled on/off.{{/disclaimer}}
+```
+
+### Optional Blocks (Appendable)
+
+Define optional text blocks (e.g. *"Keep comments minimal"*) that can be toggled on or off via checkboxes when building a prompt. Reorder them with up/down buttons, edit their text inline at any time. These are appended to the end of the prompt.
 
 ### Either / Or Groups
 
@@ -45,7 +67,15 @@ Create groups of mutually exclusive options rendered as radio buttons. Exactly o
 
 ### Snippets & Constants
 
-Create reusable text fragments with a key (`[[key]]`). Reference them in any number of templates — Prompt Manager expands them automatically at build time. An autocomplete dropdown appears in the editor as soon as you type `[[`.
+Create reusable text fragments with a key (`[[key]]`). Reference them in any number of templates — Prompt Manager expands them automatically at build time. An autocomplete dropdown appears in the editor as soon as you type `[[`. The same autocomplete works for block markers when typing `{{#` or `{{/`.
+
+### Auto-Backup
+
+On app startup, Prompt Manager automatically checks if a weekly backup is needed (Monday-based check). Backups are saved as JSON files to a configurable folder (default: `./backup` next to the executable). The backup panel in the template list header lets you:
+
+- Enable/disable auto-backup
+- Choose a custom backup folder via native OS dialog
+- Trigger a manual backup at any time
 
 ### Multi-Category System
 
@@ -98,10 +128,13 @@ The builder processes the template in this order:
 
 | Step | Action | Syntax |
 |------|--------|--------|
-| 1 | Snippet expansion | `[[key]]` → stored text |
-| 2 | Placeholder substitution | `{{name}}` → user input |
-| 3 | Append optionals | Checked optional blocks are appended |
-| 4 | Append either/or | Selected radio option per group is appended |
+| 1 | Remove disabled blocks | `{{#name}}...{{/name}}` → removed entirely |
+| 2 | Strip enabled block markers | `{{#name}}` / `{{/name}}` → removed, content kept |
+| 3 | Remove disabled optional lines | Lines with disabled `{{name}}` → removed |
+| 4 | Snippet expansion | `[[key]]` → stored text |
+| 5 | Placeholder substitution | `{{name}}` → user input / list / choicelist value |
+| 6 | Append optionals | Checked optional blocks are appended |
+| 7 | Append either/or | Selected radio option per group is appended |
 
 ### Data Storage
 
@@ -113,6 +146,8 @@ All data is stored exclusively in the **localStorage** of the Tauri WebView — 
 | `prompt-manager-snippets` | All snippets (JSON) |
 | `prompt-manager-history` | Last 50 prompts (JSON) |
 | `pm-theme` | Active theme (`light` / `dark`) |
+| `pm-backup-settings` | Backup configuration (enabled, folder path) |
+| `pm-last-backup` | ISO timestamp of last auto-backup |
 
 ---
 
@@ -171,7 +206,9 @@ The Rust backend is intentionally minimal. It only handles tasks that a pure web
 
 - **Global shortcut** (`Ctrl+1`): Registers system-wide and toggles the app window
 - **Theme sync**: Sets the native title bar theme to match the app theme
-- **Plugin initialization**: Activates the `global-shortcut` and `opener` plugins on startup
+- **Plugin initialization**: Activates the `global-shortcut`, `opener`, `fs`, and `dialog` plugins on startup
+- **File system access**: The `fs` plugin enables auto-backup to write JSON files to disk
+- **Native dialogs**: The `dialog` plugin provides the OS folder picker for backup configuration
 
 All business logic — template management, prompt assembly, export/import — runs entirely in the frontend.
 
@@ -200,7 +237,8 @@ prompt-manager/
 │   │   ├── TemplateEditor.svelte # Create & edit templates
 │   │   ├── PromptBuilder.svelte  # Fill placeholders & copy prompt
 │   │   ├── SnippetManager.svelte # Snippet management (CRUD)
-│   │   └── PromptHistory.svelte  # View prompt history
+│   │   ├── PromptHistory.svelte  # View prompt history
+│   │   └── backup.ts            # Auto-backup service (settings, scheduling, file I/O)
 │   ├── app.css                   # Global styles (light/dark themes)
 │   └── app.html                  # HTML shell
 │
