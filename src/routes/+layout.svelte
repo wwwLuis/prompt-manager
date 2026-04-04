@@ -4,6 +4,7 @@
   import { writable } from "svelte/store";
   import { setContext } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { checkAndRunAutoBackup } from "$lib/backup";
 
   const theme = writable<"light" | "dark">("light");
   setContext("theme", theme);
@@ -23,6 +24,13 @@
     if (saved === "dark") {
       theme.set("dark");
     }
+
+    // Auto-backup check on startup
+    checkAndRunAutoBackup().then(({ ran, success }) => {
+      if (ran) {
+        console.log(success ? "Auto-backup completed successfully" : "Auto-backup failed");
+      }
+    });
   });
 
   // Keep DOM + native titlebar in sync whenever theme changes

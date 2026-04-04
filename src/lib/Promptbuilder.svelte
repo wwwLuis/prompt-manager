@@ -1,6 +1,6 @@
 <script lang="ts">
   import { fade, fly, scale } from "svelte/transition";
-  import { type Template, snippetMap, applySnippets, promptHistory } from "./store";
+  import { type Template, snippetMap, applySnippets, promptHistory, extractOptionalBlocks } from "./store";
 
   export let template: Template;
   export let onBack: () => void;
@@ -10,6 +10,74 @@
   let checked: Record<number, boolean> = {};
   let eoSelected: Record<number, number> = {};  // group index → selected option index
   let copied = false;
+
+  // List inputs: placeholder → string[]
+  let listValues: Record<string, string[]> = {};
+  let listInputs: Record<string, string> = {}; // current input text per list placeholder
+
+  // Choicelist: placeholder → selected option string
+  let choicelistSelected: Record<string, string> = {};
+
+  // Optional vars: enabled state (default true = included)
+  $: optionalVarSet = new Set(template.optionalVars ?? []);
+  let optVarEnabled: Record<string, boolean> = {};
+  // Initialize: all optional vars start enabled
+  $: {
+    for (const p of template.optionalVars ?? []) {
+      if (optVarEnabled[p] === undefined) {
+        optVarEnabled[p] = true;
+      }
+    }
+  }
+
+  $: listSet = new Set(template.lists ?? []);
+  $: choicelistMap = template.choicelists ?? {};
+  $: choicelistKeys = new Set(Object.keys(choicelistMap));
+
+  // Standalone blocks: {{#name}}...{{/name}} where name is NOT a placeholder
+  $: allBlockNames = extractOptionalBlocks(template.body);
+  $: standaloneBlocks = allBlockNames.filter((b) => !template.placeholders.includes(b));
+  let blockEnabled: Record<string, boolean> = {};
+  $: {
+    for (const b of standaloneBlocks) {
+      if (blockEnabled[b] === undefined) blockEnabled[b] = true;
+    }
+  }
+  function toggleBlock(b: string) {
+    blockEnabled = { ...blockEnabled, [b]: !blockEnabled[b] };
+  }
+
+  function toggleOptVarEnabled(p: string) {
+    optVarEnabled = { ...optVarEnabled, [p]: !optVarEnabled[p] };
+  }
+
+  function addListItem(p: string) {
+    const text = (listInputs[p] || "").trim();
+    if (!text) return;
+    const items = listValues[p] || [];
+    listValues = { ...listValues, [p]: [...items, text] };
+    listInputs = { ...listInputs, [p]: "" };
+  }
+
+  function removeListItem(p: string, i: number) {
+    const items = listValues[p] || [];
+    listValues = { ...listValues, [p]: items.filter((_, idx) => idx !== i) };
+  }
+
+  function handleListKeydown(e: KeyboardEvent, p: string) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      addListItem(p);
+    }
+  }
+
+  function setListInput(p: string, val: string) {
+    listInputs = { ...listInputs, [p]: val };
+  }
+
+  function selectChoicelist(p: string, option: string) {
+    choicelistSelected = { ...choicelistSelected, [p]: option };
+  }
 
   function setVal(key: string, val: string) {
     values = { ...values, [key]: val };
@@ -23,28 +91,107 @@
     eoSelected = { ...eoSelected, [groupIdx]: optIdx };
   }
 
-  $: prompt = buildPrompt(template, values, checked, eoSelected, $snippetMap);
+  $: prompt = buildPrompt(template, values, checked, eoSelected, $snippetMap, optVarEnabled, listValues, choicelistSelected, blockEnabled);
 
   function buildPrompt(
     tpl: Template,
     vals: Record<string, string>,
     chk: Record<number, boolean>,
     eoSel: Record<number, number>,
-    snipMap: Map<string, string>
+    snipMap: Map<string, string>,
+    ovEnabled: Record<string, boolean>,
+    listVals: Record<string, string[]>,
+    choiceSel: Record<string, string>,
+    blkEnabled: Record<string, boolean>
   ): string {
     let result = tpl.body;
-    // 1. Replace snippets [[key]] → snippet value
-    result = applySnippets(result, snipMap);
-    // 2. Replace placeholders {{name}} → user input
-    for (const p of tpl.placeholders) {
-      result = result.replaceAll(`{{${p}}}`, vals[p] || `{{${p}}}`);
+
+    // 1. Handle all blocks: {{#name}}...{{/name}}
+    const optSet = new Set(tpl.optionalVars ?? []);
+    const allBlocks = extractOptionalBlocks(tpl.body);
+
+    // Collect all disabled block names (from optional vars + standalone blocks)
+    const disabledBlocks = new Set<string>();
+    for (const b of allBlocks) {
+      const isPlaceholder = tpl.placeholders.includes(b);
+      if (isPlaceholder && optSet.has(b) && !ovEnabled[b]) {
+        disabledBlocks.add(b);
+      } else if (!isPlaceholder && blkEnabled[b] === false) {
+        disabledBlocks.add(b);
+      }
     }
-    // 3. Append selected optionals
+
+    // Remove disabled blocks entirely
+    for (const b of disabledBlocks) {
+      const blockRe = new RegExp(`\\{\\{#${b}\\}\\}[\\s\\S]*?\\{\\{/${b}\\}\\}`, "g");
+      result = result.replace(blockRe, "");
+    }
+    // For enabled blocks, strip markers but keep content
+    for (const b of allBlocks) {
+      if (!disabledBlocks.has(b)) {
+        result = result.replaceAll(`{{#${b}}}`, "");
+        result = result.replaceAll(`{{/${b}}}`, "");
+      }
+    }
+
+    // Also remove lines with disabled optional placeholder vars that aren't inside blocks
+    const disabledOptionals = new Set<string>();
+    for (const p of tpl.placeholders) {
+      if (optSet.has(p) && !ovEnabled[p]) {
+        disabledOptionals.add(p);
+      }
+    }
+    if (disabledOptionals.size > 0) {
+      const lines = result.split("\n");
+      const filtered = lines.filter((line) => {
+        for (const p of disabledOptionals) {
+          if (line.includes(`{{${p}}}`)) return false;
+        }
+        return true;
+      });
+      result = filtered.join("\n");
+    }
+
+    // 2. Replace snippets [[key]] → snippet value
+    result = applySnippets(result, snipMap);
+
+    // 3. Replace placeholders {{name}} → user input (or list/choicelist values)
+    const listSetLocal = new Set(tpl.lists ?? []);
+    const choicelistMapLocal = tpl.choicelists ?? {};
+    for (const p of tpl.placeholders) {
+      if (disabledOptionals.has(p)) continue; // already removed
+      if (listSetLocal.has(p)) {
+        const items = listVals[p] || [];
+        const formatted = items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : `{{${p}}}`;
+        result = result.replaceAll(`{{${p}}}`, formatted);
+      } else if (p in choicelistMapLocal) {
+        const selectedOpt = choiceSel[p] || "";
+        let resolvedValue = `{{${p}}}`;
+        if (selectedOpt) {
+          // If it's a snippet reference [[key]], resolve it
+          const snippetMatch = selectedOpt.match(/^\[\[(\w+)\]\]$/);
+          if (snippetMatch) {
+            resolvedValue = snipMap.get(snippetMatch[1]) ?? selectedOpt;
+          } else {
+            resolvedValue = selectedOpt;
+          }
+        }
+        result = result.replaceAll(`{{${p}}}`, resolvedValue);
+      } else {
+        result = result.replaceAll(`{{${p}}}`, vals[p] || `{{${p}}}`);
+      }
+    }
+
+    // 4. Clean up multiple empty lines
+    result = result.replace(/\n{3,}/g, "\n\n");
+
+    // 5. Append selected optionals
     const active = tpl.optionals.filter((_, i) => chk[i]);
     if (active.length > 0) {
       result += "\n\n" + active.join("\n");
     }
-    // 4. Append selected either/or options
+
+    // 6. Append selected either/or options
     const eoGroups = tpl.eitherOrs ?? [];
     const eoActive = eoGroups
       .map((group, gi) => group[eoSel[gi] ?? 0])
@@ -52,7 +199,7 @@
     if (eoActive.length > 0) {
       result += "\n\n" + eoActive.join("\n");
     }
-    return result;
+    return result.trim();
   }
 
   $: allFilled = template.placeholders.every(
@@ -100,24 +247,129 @@
   {#if template.placeholders.length > 0}
     <div class="fields">
       {#each template.placeholders as p, i}
-        <div class="field" in:fly={{ y: 8, duration: 150, delay: i * 40 }}>
-          <label class="label" for="ph-{p}">{p}</label>
-          {#if textareaSet.has(p)}
-            <textarea
-              id="ph-{p}"
-              value={values[p] || ""}
-              on:input={(e) => setVal(p, e.currentTarget.value)}
-              placeholder="{p} hier einfügen…"
-              rows="5"
-              class="mono"
-            ></textarea>
+        <div class="field" class:field-disabled={optionalVarSet.has(p) && !optVarEnabled[p]} in:fly={{ y: 8, duration: 150, delay: i * 40 }}>
+          <div class="label-row">
+            <label class="label" for="ph-{p}">{p}</label>
+            {#if optionalVarSet.has(p)}
+              <button
+                class="opt-pill"
+                class:opt-pill-off={!optVarEnabled[p]}
+                on:click={() => toggleOptVarEnabled(p)}
+                title={optVarEnabled[p] !== false ? "Abschnitt deaktivieren" : "Abschnitt aktivieren"}
+              >
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
+                  {#if optVarEnabled[p] !== false}
+                    <polyline points="20 6 9 17 4 12" />
+                  {:else}
+                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                  {/if}
+                </svg>
+                {optVarEnabled[p] !== false ? "an" : "aus"}
+              </button>
+            {/if}
+          </div>
+          {#if !optionalVarSet.has(p) || optVarEnabled[p] !== false}
+            {#if listSet.has(p)}
+              <!-- List input -->
+              <div class="list-input-wrap">
+                {#if (listValues[p] || []).length > 0}
+                  <div class="list-items">
+                    {#each listValues[p] || [] as item, li}
+                      <div class="list-item" in:fly={{ x: -8, duration: 120 }}>
+                        <span class="list-bullet">-</span>
+                        <span class="list-item-text">{item}</span>
+                        <button class="list-item-remove" on:click={() => removeListItem(p, li)} title="Entfernen">
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                            <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                          </svg>
+                        </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+                <div class="list-add-row">
+                  <input
+                    id="ph-{p}"
+                    value={listInputs[p] || ""}
+                    on:input={(e) => setListInput(p, e.currentTarget.value)}
+                    on:keydown={(e) => handleListKeydown(e, p)}
+                    placeholder="Eintrag hinzufügen… (Enter)"
+                  />
+                  <button class="list-add-btn" on:click={() => addListItem(p)} title="Hinzufügen">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                      <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            {:else if choicelistKeys.has(p)}
+              <!-- Choicelist (dropdown) -->
+              {#if (choicelistMap[p] || []).length > 0}
+                <select
+                  id="ph-{p}"
+                  class="choicelist-dropdown-select"
+                  value={choicelistSelected[p] || ""}
+                  on:change={(e) => selectChoicelist(p, e.currentTarget.value)}
+                >
+                  <option value="" disabled>— Option wählen —</option>
+                  {#each choicelistMap[p] as opt}
+                    <option value={opt}>{opt.startsWith("[[") && opt.endsWith("]]") ? opt.slice(2, -2) + " (Snippet)" : opt}</option>
+                  {/each}
+                </select>
+              {:else}
+                <span class="choicelist-no-options">Keine Optionen definiert — bearbeite das Template um Optionen hinzuzufügen.</span>
+              {/if}
+            {:else if textareaSet.has(p)}
+              <textarea
+                id="ph-{p}"
+                value={values[p] || ""}
+                on:input={(e) => setVal(p, e.currentTarget.value)}
+                placeholder="{p} hier einfügen…"
+                rows="5"
+                class="mono"
+              ></textarea>
+            {:else}
+              <input
+                id="ph-{p}"
+                value={values[p] || ""}
+                on:input={(e) => setVal(p, e.currentTarget.value)}
+                placeholder="{p} eingeben…"
+              />
+            {/if}
           {:else}
-            <input
-              id="ph-{p}"
-              value={values[p] || ""}
-              on:input={(e) => setVal(p, e.currentTarget.value)}
-              placeholder="{p} eingeben…"
-            />
+            <div class="field-disabled-hint">Abschnitt deaktiviert - wird nicht im Prompt erscheinen</div>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+
+  <!-- Standalone block toggles -->
+  {#if standaloneBlocks.length > 0}
+    <div class="fields standalone-blocks">
+      <span class="label">Abschnitte</span>
+      {#each standaloneBlocks as b, i}
+        <div class="field standalone-block-field" class:field-disabled={blockEnabled[b] === false} in:fly={{ y: 8, duration: 150, delay: i * 40 }}>
+          <div class="label-row">
+            <label class="label">{b}</label>
+            <button
+              class="opt-pill"
+              class:opt-pill-off={blockEnabled[b] === false}
+              on:click={() => toggleBlock(b)}
+              title={blockEnabled[b] !== false ? "Abschnitt deaktivieren" : "Abschnitt aktivieren"}
+            >
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
+                {#if blockEnabled[b] !== false}
+                  <polyline points="20 6 9 17 4 12" />
+                {:else}
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                {/if}
+              </svg>
+              {blockEnabled[b] !== false ? "an" : "aus"}
+            </button>
+          </div>
+          {#if blockEnabled[b] === false}
+            <div class="field-disabled-hint">Abschnitt deaktiviert</div>
           {/if}
         </div>
       {/each}
@@ -457,4 +709,179 @@
     border-radius: 50%;
     background: var(--accent);
   }
+
+  /* ── Optional Variable Pill ── */
+  .label-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+
+  .label-row > .label {
+    margin-bottom: 0;
+  }
+
+  .opt-pill {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 3px;
+    padding: 0;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border: none;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
+    transition: color var(--transition);
+    flex-shrink: 0;
+  }
+
+  .opt-pill:hover {
+    color: var(--accent-hover, #4338ca);
+  }
+
+  .opt-pill-off {
+    color: var(--text-muted);
+  }
+
+  .opt-pill-off:hover {
+    color: var(--text-secondary);
+  }
+
+  .field-disabled {
+    opacity: 0.45;
+  }
+
+  .field-disabled-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 6px 0;
+  }
+
+  /* ── Choicelist Dropdown ── */
+  .choicelist-dropdown-select {
+    width: 100%;
+    padding: 10px 14px;
+    font-size: 13.5px;
+    color: var(--text);
+    background: var(--bg-card);
+    border: 1.5px solid var(--border-light);
+    border-radius: var(--radius);
+    transition: all var(--transition);
+    cursor: pointer;
+    appearance: auto;
+  }
+
+  .choicelist-dropdown-select:hover {
+    border-color: var(--border);
+  }
+
+  .choicelist-dropdown-select:focus {
+    border-color: var(--accent);
+    outline: none;
+    box-shadow: 0 0 0 3px var(--accent-bg);
+  }
+
+  .choicelist-no-options {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 8px 0;
+  }
+
+  /* ── List Input ── */
+  .list-input-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .list-items {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .list-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    transition: all var(--transition);
+  }
+
+  .list-item:hover {
+    border-color: var(--border);
+  }
+
+  .list-bullet {
+    font-weight: 700;
+    color: var(--accent);
+    flex-shrink: 0;
+    font-size: 14px;
+  }
+
+  .list-item-text {
+    flex: 1;
+    font-size: 13.5px;
+    color: var(--text);
+  }
+
+  .list-item-remove {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    color: var(--text-muted);
+    opacity: 0;
+    transition: all var(--transition);
+    flex-shrink: 0;
+  }
+
+  .list-item:hover .list-item-remove {
+    opacity: 1;
+  }
+
+  .list-item-remove:hover {
+    color: var(--danger, #ef4444);
+    background: var(--danger-bg, #fef2f2);
+  }
+
+  .list-add-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .list-add-row input {
+    flex: 1;
+  }
+
+  .list-add-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 42px;
+    flex-shrink: 0;
+    background: var(--bg-card);
+    border: 1.5px solid var(--border-light);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    transition: all var(--transition);
+  }
+
+  .list-add-btn:hover {
+    background: var(--accent-bg);
+    border-color: var(--accent-border);
+    color: var(--accent);
+  }
+
 </style>

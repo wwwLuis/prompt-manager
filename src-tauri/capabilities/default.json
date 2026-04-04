@@ -10,6 +10,23 @@
     "global-shortcut:allow-unregister",
     "global-shortcut:allow-is-registered",
     "core:window:allow-set-theme",
-    "core:window:allow-theme"
+    "core:window:allow-theme",
+    "fs:default",
+    "fs:allow-exists",
+    "fs:allow-mkdir",
+    "fs:allow-write-text-file",
+    "fs:allow-read-text-file",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        { "path": "$DOCUMENT/**" },
+        { "path": "$DOWNLOAD/**" },
+        { "path": "$APPDATA/**" },
+        { "path": "$HOME/**" },
+        { "path": "$RESOURCE/**" }
+      ]
+    },
+    "dialog:default",
+    "dialog:allow-open"
   ]
 }

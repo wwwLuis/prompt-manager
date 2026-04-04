@@ -4,6 +4,8 @@
   import { getContext } from "svelte";
   import type { Writable } from "svelte/store";
   import { templates, categories, snippets, extractSnippetRefs, type Template, type Snippet } from "./store";
+  import { loadBackupSettings, saveBackupSettings, chooseBackupFolder, performAutoBackup, getDefaultBackupFolder, type BackupSettings } from "./backup";
+  import { onMount } from "svelte";
 
   export let onNew: () => void;
   export let onEdit: (t: Template) => void;
@@ -225,6 +227,45 @@
       onUse(t);
     }
   }
+
+  // ── Backup settings ──
+  let showBackupSettings = false;
+  let backupSettings: BackupSettings = loadBackupSettings();
+  let backupBusy = false;
+
+  // Initialize default backup folder if not set
+  onMount(async () => {
+    if (!backupSettings.folderPath) {
+      const defaultFolder = await getDefaultBackupFolder();
+      backupSettings = { ...backupSettings, folderPath: defaultFolder };
+      saveBackupSettings(backupSettings);
+    }
+  });
+
+  function toggleBackupPanel() {
+    showBackupSettings = !showBackupSettings;
+  }
+
+  async function pickBackupFolder() {
+    const folder = await chooseBackupFolder();
+    if (folder) {
+      backupSettings = { ...backupSettings, folderPath: folder };
+      saveBackupSettings(backupSettings);
+    }
+  }
+
+  function toggleBackupEnabled() {
+    backupSettings = { ...backupSettings, enabled: !backupSettings.enabled };
+    saveBackupSettings(backupSettings);
+  }
+
+  async function runManualBackup() {
+    if (!backupSettings.folderPath) return;
+    backupBusy = true;
+    const success = await performAutoBackup(backupSettings.folderPath);
+    backupBusy = false;
+    flash(success ? "Backup erfolgreich erstellt" : "Backup fehlgeschlagen");
+  }
 </script>
 
 <!-- Hidden file input for import -->
@@ -246,6 +287,13 @@
   </div>
   <div class="header-actions">
     {#if !exportMode}
+      <button class="btn-icon-label" on:click={toggleBackupPanel} title="Backup-Einstellungen" class:active-icon={showBackupSettings}>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+        </svg>
+      </button>
       <button class="btn-icon-label" on:click={toggleTheme} title="Theme wechseln">
         {#if $theme === "light"}
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -326,6 +374,47 @@
         Exportieren ({selected.size})
       </button>
     </div>
+  </div>
+{/if}
+
+<!-- Backup Settings Panel -->
+{#if showBackupSettings}
+  <div class="backup-panel" transition:slide={{ duration: 150 }}>
+    <div class="backup-header">
+      <span class="backup-title">Auto-Backup</span>
+      <label class="backup-toggle">
+        <input type="checkbox" checked={backupSettings.enabled} on:change={toggleBackupEnabled} class="sr-only" />
+        <div class="toggle-track" class:on={backupSettings.enabled}>
+          <div class="toggle-thumb"></div>
+        </div>
+      </label>
+    </div>
+    <p class="backup-desc">Erstellt automatisch ein w&ouml;chentliches Backup beim App-Start (jeden Montag).</p>
+    <div class="backup-folder-row">
+      <div class="backup-folder-display">
+        {#if backupSettings.folderPath}
+          <span class="backup-path">{backupSettings.folderPath}</span>
+        {:else}
+          <span class="backup-path-empty">Kein Ordner ausgew&auml;hlt</span>
+        {/if}
+      </div>
+      <button class="btn-secondary backup-browse-btn" on:click={pickBackupFolder}>
+        Ordner w&auml;hlen
+      </button>
+    </div>
+    {#if backupSettings.folderPath}
+      <button
+        class="btn-secondary backup-now-btn"
+        on:click={runManualBackup}
+        disabled={backupBusy}
+      >
+        {#if backupBusy}
+          Backup l&auml;uft…
+        {:else}
+          Jetzt Backup erstellen
+        {/if}
+      </button>
+    {/if}
   </div>
 {/if}
 
@@ -873,5 +962,119 @@
     border-radius: 5px;
     box-shadow: 0 1px 0 var(--border);
     line-height: 1.3;
+  }
+
+  /* ── Backup Settings Panel ── */
+  .active-icon {
+    color: var(--accent) !important;
+    border-color: var(--accent-border) !important;
+    background: var(--accent-bg) !important;
+  }
+
+  .backup-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px 18px;
+    margin-bottom: 20px;
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius-lg);
+  }
+
+  .backup-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .backup-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .backup-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.4;
+    margin: 0;
+  }
+
+  .backup-toggle {
+    cursor: pointer;
+  }
+
+  .toggle-track {
+    width: 40px;
+    height: 22px;
+    border-radius: 11px;
+    background: var(--border);
+    position: relative;
+    transition: background var(--transition);
+  }
+
+  .toggle-track.on {
+    background: var(--accent);
+  }
+
+  .toggle-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #fff;
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    transition: transform var(--transition);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+  }
+
+  .toggle-track.on .toggle-thumb {
+    transform: translateX(18px);
+  }
+
+  .backup-folder-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .backup-folder-display {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .backup-path {
+    font-size: 12px;
+    color: var(--text);
+    font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: block;
+  }
+
+  .backup-path-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .backup-browse-btn {
+    flex-shrink: 0;
+    font-size: 12px;
+    padding: 8px 14px;
+  }
+
+  .backup-now-btn {
+    font-size: 12px;
+    padding: 8px 14px;
+    align-self: flex-start;
   }
 </style>

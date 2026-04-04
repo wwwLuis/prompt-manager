@@ -11,6 +11,12 @@ export interface Template {
   placeholders: string[];
   /** Placeholders that should render as textarea (multiline) */
   textareas: string[];
+  /** Placeholders that should render as list input (enter adds new item) */
+  lists: string[];
+  /** Placeholders that are optional (whole line removed when unchecked) */
+  optionalVars: string[];
+  /** Placeholders that should render as a choice/dropdown list */
+  choicelists: Record<string, string[]>; // placeholder name → option strings (or [[snippetKey]] refs)
   optionals: string[];
   /** Either/Or groups: each group is an array of alternatives (pick one) */
   eitherOrs: string[][];
@@ -28,6 +34,9 @@ function loadTemplates(): Template[] {
     return parsed.map((t: any) => ({
       ...t,
       textareas: t.textareas ?? [],
+      lists: t.lists ?? [],
+      optionalVars: t.optionalVars ?? [],
+      choicelists: t.choicelists ?? {},
       eitherOrs: t.eitherOrs ?? [],
       category: Array.isArray(t.category)
         ? t.category
@@ -79,6 +88,9 @@ function createTemplateStore() {
           .map((t: any) => ({
             ...t,
             textareas: t.textareas ?? [],
+            lists: t.lists ?? [],
+            optionalVars: t.optionalVars ?? [],
+            choicelists: t.choicelists ?? {},
             eitherOrs: t.eitherOrs ?? [],
             category: Array.isArray(t.category)
               ? t.category
@@ -255,3 +267,10 @@ export function extractPlaceholders(text: string): string[] {
   const m = text.match(/\{\{(\w+)\}\}/g) || [];
   return [...new Set(m.map((x) => x.slice(2, -2)))];
 }
+
+/** Extract optional block markers {{#name}}...{{/name}} from template body */
+export function extractOptionalBlocks(text: string): string[] {
+  const m = text.match(/\{\{#(\w+)\}\}/g) || [];
+  return [...new Set(m.map((x) => x.slice(3, -2)))];
+}
+

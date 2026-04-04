@@ -23,41 +23,88 @@
     ? template.eitherOrs.map((g) => [...g])
     : [];
   let textareas: Set<string> = new Set(template?.textareas ?? []);
+  let lists: Set<string> = new Set(template?.lists ?? []);
+  let optionalVars: Set<string> = new Set(template?.optionalVars ?? []);
+  let choicelists: Record<string, string[]> = template?.choicelists ? { ...template.choicelists } : {};
   let newOpt = "";
   let newEoOptions: string[] = ["", ""];  // current either/or group being built
   let showCatSuggestions = false;
+  // Track which placeholder has its choicelist snippet picker open
+  let choicelistOpenFor: string | null = null;
 
-  // ── Snippet autocomplete ──
+  // ── Autocomplete (snippets + block markers) ──
   let bodyEl: HTMLTextAreaElement;
   let acVisible = false;
   let acQuery = "";
   let acIndex = 0;
-  let acStart = -1; // cursor position where [[ starts
+  let acStart = -1; // cursor position where trigger starts
   let acTop = 0;
   let acLeft = 0;
+  let acMode: "snippet" | "block-open" | "block-close" = "snippet";
 
-  $: acFiltered = acQuery
-    ? $snippets.filter((s) =>
-        s.key.toLowerCase().startsWith(acQuery.toLowerCase())
-      )
-    : $snippets;
+  // Autocomplete items depend on mode
+  $: acItems = (() => {
+    if (acMode === "snippet") {
+      const filtered = acQuery
+        ? $snippets.filter((s) => s.key.toLowerCase().startsWith(acQuery.toLowerCase()))
+        : $snippets;
+      return filtered.map((s) => ({ key: s.key, desc: s.description }));
+    } else {
+      // block-open or block-close: suggest existing placeholder names
+      const filtered = acQuery
+        ? placeholders.filter((p) => p.toLowerCase().startsWith(acQuery.toLowerCase()))
+        : placeholders;
+      return filtered.map((p) => ({ key: p, desc: acMode === "block-open" ? "Block öffnen" : "Block schließen" }));
+    }
+  })();
 
   function handleBodyInput() {
     if (!bodyEl) return;
     const pos = bodyEl.selectionStart;
     const text = bodyEl.value;
-
-    // Look backwards from cursor for [[ that isn't closed yet
     const before = text.slice(0, pos);
+
+    // Check for {{# (block open)
+    const blockOpenIdx = before.lastIndexOf("{{#");
+    const blockOpenClose = before.lastIndexOf("}}", blockOpenIdx > 0 ? blockOpenIdx : 0);
+    if (blockOpenIdx >= 0 && blockOpenIdx > blockOpenClose) {
+      const partial = before.slice(blockOpenIdx + 3);
+      if (/^\w*$/.test(partial) && placeholders.length > 0) {
+        acQuery = partial;
+        acStart = blockOpenIdx;
+        acMode = "block-open";
+        acIndex = 0;
+        acVisible = true;
+        positionDropdown();
+        return;
+      }
+    }
+
+    // Check for {{/ (block close)
+    const blockCloseIdx = before.lastIndexOf("{{/");
+    const blockCloseClose = before.lastIndexOf("}}", blockCloseIdx > 0 ? blockCloseIdx : 0);
+    if (blockCloseIdx >= 0 && blockCloseIdx > blockCloseClose) {
+      const partial = before.slice(blockCloseIdx + 3);
+      if (/^\w*$/.test(partial) && placeholders.length > 0) {
+        acQuery = partial;
+        acStart = blockCloseIdx;
+        acMode = "block-close";
+        acIndex = 0;
+        acVisible = true;
+        positionDropdown();
+        return;
+      }
+    }
+
+    // Check for [[ (snippet)
     const openIdx = before.lastIndexOf("[[");
     const closeIdx = before.lastIndexOf("]]");
-
     if (openIdx >= 0 && openIdx > closeIdx) {
       const partial = before.slice(openIdx + 2);
-      // Only show if partial is a valid key fragment (word chars only, no newlines)
       if (/^\w*$/.test(partial) && $snippets.length > 0) {
         acQuery = partial;
         acStart = openIdx;
+        acMode = "snippet";
         acIndex = 0;
         acVisible = true;
         positionDropdown();
@@ -95,34 +142,43 @@
     if (acLeft < 0) acLeft = 0;
   }
 
-  function insertSnippet(key: string) {
+  function insertAutocomplete(key: string) {
     if (!bodyEl || acStart < 0) return;
     const before = body.slice(0, acStart);
     const after = body.slice(bodyEl.selectionStart);
-    body = before + `[[${key}]]` + after;
+
+    let insertion: string;
+    if (acMode === "snippet") {
+      insertion = `[[${key}]]`;
+    } else if (acMode === "block-open") {
+      insertion = `{{#${key}}}`;
+    } else {
+      insertion = `{{/${key}}}`;
+    }
+
+    body = before + insertion + after;
     acVisible = false;
 
-    // Restore focus and cursor position
     requestAnimationFrame(() => {
       if (!bodyEl) return;
-      const newPos = acStart + key.length + 4; // [[ + key + ]]
+      const newPos = acStart + insertion.length;
       bodyEl.focus();
       bodyEl.setSelectionRange(newPos, newPos);
     });
   }
 
   function handleBodyKeydown(e: KeyboardEvent) {
-    if (!acVisible || acFiltered.length === 0) return;
+    if (!acVisible || acItems.length === 0) return;
 
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      acIndex = (acIndex + 1) % acFiltered.length;
+      acIndex = (acIndex + 1) % acItems.length;
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      acIndex = (acIndex - 1 + acFiltered.length) % acFiltered.length;
+      acIndex = (acIndex - 1 + acItems.length) % acItems.length;
     } else if (e.key === "Enter" || e.key === "Tab") {
       e.preventDefault();
-      insertSnippet(acFiltered[acIndex].key);
+      insertAutocomplete(acItems[acIndex].key);
     } else if (e.key === "Escape") {
       e.preventDefault();
       acVisible = false;
@@ -139,13 +195,79 @@
   $: availableSnippetKeys = $snippets.map((s) => s.key);
   $: canSave = name.trim().length > 0 && body.trim().length > 0;
 
-  function toggleTextarea(p: string) {
-    if (textareas.has(p)) {
-      textareas.delete(p);
-    } else {
-      textareas.add(p);
+  type PlaceholderType = "input" | "textarea" | "list" | "choicelist";
+
+  // Reactive map of placeholder → type (must be a reactive statement, not just a function,
+  // so that Svelte re-renders when choicelists/lists/textareas change)
+  $: placeholderTypes = (() => {
+    const map: Record<string, PlaceholderType> = {};
+    for (const p of placeholders) {
+      if (p in choicelists) map[p] = "choicelist";
+      else if (lists.has(p)) map[p] = "list";
+      else if (textareas.has(p)) map[p] = "textarea";
+      else map[p] = "input";
     }
-    textareas = new Set(textareas); // trigger reactivity
+    return map;
+  })();
+
+  function getPlaceholderType(p: string): PlaceholderType {
+    return placeholderTypes[p] ?? "input";
+  }
+
+  function setPlaceholderType(p: string, type: PlaceholderType) {
+    // Save existing choicelist options before clearing
+    const savedOptions = choicelists[p] ?? [];
+
+    // Clear from all sets first
+    textareas.delete(p);
+    lists.delete(p);
+    const { [p]: _, ...restChoicelists } = choicelists;
+    choicelists = restChoicelists;
+
+    // Set the new type
+    if (type === "textarea") textareas.add(p);
+    else if (type === "list") lists.add(p);
+    else if (type === "choicelist") choicelists = { ...choicelists, [p]: savedOptions };
+
+    // Trigger reactivity
+    textareas = new Set(textareas);
+    lists = new Set(lists);
+  }
+
+  function toggleOptionalVar(p: string) {
+    if (optionalVars.has(p)) {
+      optionalVars.delete(p);
+    } else {
+      optionalVars.add(p);
+    }
+    optionalVars = new Set(optionalVars);
+  }
+
+  function addChoicelistOption(p: string, option: string) {
+    const current = choicelists[p] || [];
+    if (option && !current.includes(option)) {
+      choicelists = { ...choicelists, [p]: [...current, option] };
+    }
+  }
+
+  function removeChoicelistOption(p: string, option: string) {
+    const current = choicelists[p] || [];
+    choicelists = { ...choicelists, [p]: current.filter((k) => k !== option) };
+  }
+
+  function toggleChoicelistPicker(p: string) {
+    choicelistOpenFor = choicelistOpenFor === p ? null : p;
+  }
+
+  // Input for adding custom text options to choicelist
+  let choicelistNewText: Record<string, string> = {};
+
+  function addChoicelistText(p: string) {
+    const text = (choicelistNewText[p] || "").trim();
+    if (text) {
+      addChoicelistOption(p, text);
+      choicelistNewText = { ...choicelistNewText, [p]: "" };
+    }
   }
 
   function addOptional() {
@@ -213,12 +335,22 @@
 
   function handleSave() {
     if (!canSave) return;
+    // Filter choicelists to only include relevant placeholders
+    const filteredChoicelists: Record<string, string[]> = {};
+    for (const p of placeholders) {
+      if (choicelists[p] !== undefined) {
+        filteredChoicelists[p] = choicelists[p];
+      }
+    }
     templates.save({
       id: template?.id || genId(),
       name: name.trim(),
       body: body.trim(),
       placeholders,
       textareas: [...textareas].filter((t) => placeholders.includes(t)),
+      lists: [...lists].filter((l) => placeholders.includes(l)),
+      optionalVars: [...optionalVars].filter((o) => placeholders.includes(o)),
+      choicelists: filteredChoicelists,
       optionals,
       eitherOrs,
       category: categoryList,
@@ -314,10 +446,12 @@
 
   <!-- Body -->
   <div class="field body-field">
-    <label class="label" for="tpl-body">
-      Template-Body
-      <span class="hint">{"{{name}}"} für Platzhalter &middot; {"[["} für Snippets</span>
-    </label>
+    <label class="label" for="tpl-body">Template-Body</label>
+    <div class="body-hints">
+      <span class="hint-tag">{"{{name}}"} Platzhalter</span>
+      <span class="hint-tag">{"{{#name}}...{{/name}}"} Optionaler Block</span>
+      <span class="hint-tag">{"[["} Snippet einfügen</span>
+    </div>
     <div class="body-textarea-wrap">
       <textarea
         id="tpl-body"
@@ -330,23 +464,23 @@
         rows="8"
       ></textarea>
 
-      <!-- Snippet autocomplete dropdown -->
-      {#if acVisible && acFiltered.length > 0}
+      <!-- Autocomplete dropdown (snippets + block markers) -->
+      {#if acVisible && acItems.length > 0}
         <div
           class="ac-dropdown"
           style="top: {acTop}px; left: {acLeft}px;"
           transition:fly={{ y: -4, duration: 100 }}
         >
-          {#each acFiltered as s, i}
+          {#each acItems as item, i}
             <button
               class="ac-item"
               class:highlighted={i === acIndex}
-              on:mousedown|preventDefault={() => insertSnippet(s.key)}
+              on:mousedown|preventDefault={() => insertAutocomplete(item.key)}
               on:mouseenter={() => (acIndex = i)}
             >
-              <code class="ac-key">[[{s.key}]]</code>
-              {#if s.description}
-                <span class="ac-desc">{s.description}</span>
+              <code class="ac-key">{acMode === "snippet" ? `[[${item.key}]]` : acMode === "block-open" ? `{{#${item.key}}}` : `{{/${item.key}}}`}</code>
+              {#if item.desc}
+                <span class="ac-desc">{item.desc}</span>
               {/if}
             </button>
           {/each}
@@ -358,34 +492,146 @@
         <span class="detected-label">Platzhalter-Typ festlegen:</span>
         <div class="placeholder-list">
           {#each placeholders as p}
-            <div class="placeholder-item" in:fly={{ y: 6, duration: 120 }}>
-              <span class="placeholder-name">{`{{${p}}}`}</span>
-              <div class="type-toggle">
-                <button
-                  class="type-btn"
-                  class:active={!textareas.has(p)}
-                  on:click={() => { if (textareas.has(p)) toggleTextarea(p); }}
-                  title="Einzeiliges Textfeld"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                    <line x1="4" y1="12" x2="20" y2="12" />
-                  </svg>
-                  Input
-                </button>
-                <button
-                  class="type-btn"
-                  class:active={textareas.has(p)}
-                  on:click={() => { if (!textareas.has(p)) toggleTextarea(p); }}
-                  title="Mehrzeiliges Textfeld"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                    <line x1="4" y1="8" x2="20" y2="8" />
-                    <line x1="4" y1="12" x2="20" y2="12" />
-                    <line x1="4" y1="16" x2="14" y2="16" />
-                  </svg>
-                  Textarea
-                </button>
+            <div class="placeholder-item-wrap" in:fly={{ y: 6, duration: 120 }}>
+              <div class="placeholder-item">
+                <span class="placeholder-name">{`{{${p}}}`}</span>
+                <div class="placeholder-controls">
+                  <label class="optional-toggle" title="Ganze Zeile optional machen (Checkbox beim Ausfüllen)">
+                    <input type="checkbox" checked={optionalVars.has(p)} on:change={() => toggleOptionalVar(p)} class="sr-only" />
+                    <div class="opt-check-mini" class:checked={optionalVars.has(p)}>
+                      {#if optionalVars.has(p)}
+                        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round">
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                      {/if}
+                    </div>
+                    <span class="optional-label">Optional</span>
+                  </label>
+                  <div class="type-toggle">
+                    <button
+                      class="type-btn"
+                      class:active={placeholderTypes[p] === "input"}
+                      on:click={() => setPlaceholderType(p, "input")}
+                      title="Einzeiliges Textfeld"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <line x1="4" y1="12" x2="20" y2="12" />
+                      </svg>
+                      Input
+                    </button>
+                    <button
+                      class="type-btn"
+                      class:active={placeholderTypes[p] === "textarea"}
+                      on:click={() => setPlaceholderType(p, "textarea")}
+                      title="Mehrzeiliges Textfeld"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <line x1="4" y1="8" x2="20" y2="8" />
+                        <line x1="4" y1="12" x2="20" y2="12" />
+                        <line x1="4" y1="16" x2="14" y2="16" />
+                      </svg>
+                      Textarea
+                    </button>
+                    <button
+                      class="type-btn"
+                      class:active={placeholderTypes[p] === "list"}
+                      on:click={() => setPlaceholderType(p, "list")}
+                      title="Formatierte Liste"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <line x1="8" y1="6" x2="21" y2="6" />
+                        <line x1="8" y1="12" x2="21" y2="12" />
+                        <line x1="8" y1="18" x2="21" y2="18" />
+                        <line x1="3" y1="6" x2="3.01" y2="6" />
+                        <line x1="3" y1="12" x2="3.01" y2="12" />
+                        <line x1="3" y1="18" x2="3.01" y2="18" />
+                      </svg>
+                      Liste
+                    </button>
+                    <button
+                      class="type-btn"
+                      class:active={placeholderTypes[p] === "choicelist"}
+                      on:click={() => setPlaceholderType(p, "choicelist")}
+                      title="Dropdown-Auswahl"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                      Auswahl
+                    </button>
+                  </div>
+                </div>
               </div>
+              <!-- Choicelist option editor -->
+              {#if placeholderTypes[p] === "choicelist"}
+                <div class="choicelist-config" in:slide={{ duration: 120 }}>
+                  <span class="choicelist-hint">Definiere die Optionen, die im Builder als Dropdown erscheinen:</span>
+                  {#if (choicelists[p] || []).length > 0}
+                    <div class="choicelist-tags">
+                      {#each choicelists[p] || [] as opt}
+                        <span class="choicelist-tag" class:snippet-tag={opt.startsWith("[[")} in:fly={{ x: -6, duration: 120 }} out:fade={{ duration: 80 }}>
+                          {#if opt.startsWith("[[")}
+                            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="flex-shrink:0">
+                              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+                              <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+                            </svg>
+                            {opt.slice(2, -2)}
+                          {:else}
+                            "{opt}"
+                          {/if}
+                          <button class="choicelist-tag-remove" on:click={() => removeChoicelistOption(p, opt)} title="Entfernen">
+                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
+                              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                            </svg>
+                          </button>
+                        </span>
+                      {/each}
+                    </div>
+                  {:else}
+                    <span class="choicelist-empty-hint">Noch keine Optionen — füge unten Text-Optionen oder Snippets hinzu.</span>
+                  {/if}
+                  <!-- Add custom text option -->
+                  <div class="choicelist-add-row">
+                    <input
+                      value={choicelistNewText[p] || ""}
+                      on:input={(e) => choicelistNewText = { ...choicelistNewText, [p]: e.currentTarget.value }}
+                      on:keydown={(e) => e.key === "Enter" && addChoicelistText(p)}
+                      placeholder="Text-Option eingeben + Enter"
+                    />
+                    <button class="btn-secondary add-btn" on:click={() => addChoicelistText(p)} title="Hinzufügen">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                        <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+                      </svg>
+                    </button>
+                  </div>
+                  <!-- Add snippet as option -->
+                  {#if $snippets.length > 0}
+                    <div class="choicelist-picker">
+                      <button class="btn-secondary choicelist-add-btn" on:click={() => toggleChoicelistPicker(p)}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+                          <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+                        </svg>
+                        Snippet als Option
+                      </button>
+                      {#if choicelistOpenFor === p}
+                        <div class="choicelist-dropdown" transition:slide={{ duration: 120 }}>
+                          {#each $snippets.filter((s) => !(choicelists[p] || []).includes(`[[${s.key}]]`)) as s}
+                            <button class="choicelist-option" on:click={() => { addChoicelistOption(p, `[[${s.key}]]`); choicelistOpenFor = null; }}>
+                              <code class="choicelist-option-key">[[{s.key}]]</code>
+                              {#if s.description}
+                                <span class="choicelist-option-desc">{s.description}</span>
+                              {/if}
+                            </button>
+                          {:else}
+                            <span class="choicelist-empty">Keine weiteren Snippets verfügbar</span>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
@@ -629,6 +875,22 @@
     font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
     font-size: 13px;
     line-height: 1.6;
+  }
+
+  .body-hints {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+
+  .hint-tag {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg-hover);
+    padding: 2px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
   }
 
   /* ── Autocomplete Dropdown ── */
@@ -1044,6 +1306,205 @@
     gap: 5px;
     font-size: 12px;
     padding: 6px 12px;
+  }
+
+  .placeholder-item-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .placeholder-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .optional-toggle {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .opt-check-mini {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all var(--transition);
+    background: var(--bg);
+  }
+
+  .opt-check-mini.checked {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .optional-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .choicelist-add-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .choicelist-add-row input {
+    flex: 1;
+    font-size: 12.5px;
+    padding: 6px 10px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+
+  /* ── Choicelist Config ── */
+  .choicelist-config {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--accent-bg);
+    border: 1px solid var(--accent-border);
+    border-top: none;
+    border-radius: 0 0 var(--radius) var(--radius);
+  }
+
+  .choicelist-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.3;
+  }
+
+  .choicelist-empty-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .snippet-tag {
+    background: var(--accent-bg);
+    border-color: var(--accent-border);
+  }
+
+  .choicelist-tags {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .choicelist-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    background: var(--bg-card);
+    color: var(--accent);
+    border-radius: 6px;
+    border: 1px solid var(--border-light);
+  }
+
+  .choicelist-tag-remove {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    color: var(--text-muted);
+    opacity: 0.6;
+    transition: opacity var(--transition);
+  }
+
+  .choicelist-tag-remove:hover {
+    opacity: 1;
+    color: var(--danger);
+  }
+
+  .choicelist-picker {
+    position: relative;
+  }
+
+  .choicelist-add-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    padding: 5px 12px;
+  }
+
+  .choicelist-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 20;
+    margin-top: 4px;
+    max-height: 200px;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 4px;
+  }
+
+  .choicelist-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-size: 12.5px;
+    color: var(--text);
+    transition: background 0.1s;
+  }
+
+  .choicelist-option:hover {
+    background: var(--accent-bg);
+  }
+
+  .choicelist-option-key {
+    font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .choicelist-option-desc {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .choicelist-empty {
+    display: block;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
   }
 
 </style>
