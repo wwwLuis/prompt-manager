@@ -815,13 +815,19 @@
     display: flex;
     flex-direction: column;
     gap: 22px;
+    padding-top: 8px;
   }
 
   .header {
+    position: sticky;
+    top: 0;
+    z-index: 50;
     display: flex;
     align-items: center;
     gap: 12px;
     margin-bottom: 4px;
+    background: var(--bg);
+    padding: 8px 0;
   }
 
   h2 {

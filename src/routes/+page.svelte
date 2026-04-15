@@ -12,27 +12,36 @@
   let view: View = "list";
   let active: Template | null = null;
 
+  function scrollTop() {
+    window.scrollTo(0, 0);
+  }
+
   function goList() {
     view = "list";
     active = null;
+    scrollTop();
   }
 
   function goEdit(t?: Template) {
     active = t ?? null;
     view = "edit";
+    scrollTop();
   }
 
   function goUse(t: Template) {
     active = t;
     view = "use";
+    scrollTop();
   }
 
   function goSnippets() {
     view = "snippets";
+    scrollTop();
   }
 
   function goHistory() {
     view = "history";
+    scrollTop();
   }
 </script>
 
@@ -52,7 +61,7 @@
     {:else if view === "edit"}
       <TemplateEditor template={active} onSave={goList} onCancel={goList} />
     {:else if view === "use" && active}
-      <PromptBuilder template={active} onBack={goList} onEdit={() => goEdit(active)} />
+      <PromptBuilder template={active} onBack={goList} onEdit={() => goEdit(active!)} />
     {:else if view === "snippets"}
       <SnippetManager onBack={goList} />
     {:else if view === "history"}
